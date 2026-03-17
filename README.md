@@ -90,13 +90,19 @@ First, make sure that cutter and python3 are installed.
 pip install -r requirements.txt
 ```
 
-Dependencies refer to `requirements.txt`. If you encounter version conflict, consider different versions of dependencies.
+`requirements.txt` is used for the standalone `mcp_server.py` wrapper.
 
-The problem is cutter load plugin directly and bypassed uv. I will consider splitting the plug-in to ease dependency management later.
+The Cutter plugin itself is `mcp_plugin.py`. It now uses Python's standard library HTTP server so it does not require FastAPI, Pydantic, or Starlette inside Cutter's embedded Python.
 
 ### Cutter plugin:
 
-This is about the `mcp_plugin.py`. It will serve as a plugin of cutter and start a HTTP API server. `mcp_server.py` will rely on it to obtain information.
+`mcp_plugin.py` runs inside Cutter and exposes a local HTTP API that `mcp_server.py` uses.
+
+Default local endpoints:
+
+`http://127.0.0.1:8000/api/v1`
+`http://127.0.0.1:8000/api/v1/health`
+`http://127.0.0.1:8000/docs`
 
 1. Run Cutter
 2. Go to **Edit -> Preferences -> Plugins**
@@ -106,7 +112,9 @@ This is about the `mcp_plugin.py`. It will serve as a plugin of cutter and start
 
 ### MCP Host:
 
-For example (in cline, cursor etc) in MCP config file:
+For example (in cline, cursor etc) in MCP config file.
+
+STDIO mode:
 
 ```json
 {
@@ -116,6 +124,30 @@ For example (in cline, cursor etc) in MCP config file:
       "args": [
         "<ABSOLUTE/PATH/TO>/mcp_server.py"
       ]
+    }
+  }
+}
+```
+
+Streamable HTTP mode:
+
+Start the Cutter plugin server first, then start the MCP wrapper:
+
+```bash
+python mcp_server.py --http --host 127.0.0.1 --port 9000
+```
+
+Then use a config like this:
+
+```json
+{
+  "mcpServers": {
+    "cutter-mcp-http": {
+      "autoApprove": [],
+      "disabled": false,
+      "timeout": 60,
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:9000/"
     }
   }
 }
@@ -141,7 +173,6 @@ Also, **be aware of the spending on tokens.**
 ## TODO
 
 1. Save tokens. 
-2. Split the plugin into two parts for convenient uv management.
 
 ## Special Thanks
 

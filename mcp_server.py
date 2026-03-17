@@ -1,4 +1,4 @@
-from __future__ import annotations
+# from __future__ import annotations
 import argparse
 import json
 from typing import Any, Dict, List, Optional
@@ -19,8 +19,8 @@ Two operating modes:
    - Run: python mcp_server.py              # defaults to stdio
    - Connect in Agents SDK with MCPServerStdio(command="python", args=["mcp_server.py"]).
 2) Remote/Responses API: Streamable HTTP transport (requires publicly accessible URL).
-   - Run: python mcp_server.py --http --port 9000    # starts HTTP /mcp/ endpoint
-   - Configure Responses API with tools=[{"type":"mcp","server_url":"https://your-domain/mcp/", ...}]
+   - Run: python mcp_server.py --http --port 9000    # starts HTTP /mcp endpoint
+   - Configure Responses API with tools=[{"type":"mcp","server_url":"https://your-domain/mcp", ...}]
 
 Note: OpenAI Responses API currently only uses MCP **tools**, not resources/prompts;
       the Agents SDK supports richer capabilities including tool filtering and caching.
@@ -188,11 +188,22 @@ def main():
     parser.add_argument("--http", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
-    parser.add_argument("--path", default="/mcp/")
+    parser.add_argument("--path", default="/")
     args = parser.parse_args()
 
     if args.http:
-        mcp.run(transport="http", host=args.host, port=args.port, path=args.path)
+        import uvicorn
+
+        streamable_http_path = args.path if args.path.startswith("/") else f"/{args.path}"
+        if streamable_http_path != "/":
+            streamable_http_path = streamable_http_path.rstrip("/")
+        mcp.settings.streamable_http_path = streamable_http_path
+        uvicorn.run(
+            mcp.streamable_http_app(),
+            host=args.host,
+            port=args.port,
+            log_level="warning",
+        )
     else:
         mcp.run()
 

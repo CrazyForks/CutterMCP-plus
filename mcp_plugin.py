@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import socket
-import sys
 import threading
-import time
 import webbrowser
-from typing import Any, Dict, List, Optional
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
-# These imports are available inside Cutter
 import cutter
 from PySide6.QtCore import QObject, SIGNAL
 from PySide6.QtGui import QAction
@@ -24,364 +22,542 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# Third-party dependencies
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
-from starlette.concurrency import run_in_threadpool
-import uvicorn
 
-# =============================
-#          FastAPI Section
-# =============================
+PLUGIN_VERSION = "0.4.0"
+_CMD_LOCK = threading.RLock()
+_MAX_BODY_BYTES = 1024 * 1024
 
-app = FastAPI(title="Cutter MCP Plugin API", version="0.3.0", docs_url="/docs")
 
-# ---- Adapter for r2/cutter: run in thread pool to avoid blocking event loop ----
-async def r2(cmd: str) -> str:
-    print(f"[MCP]: {cmd}")
-    return await run_in_threadpool(cutter.cmd, cmd)
+class ApiError(Exception):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
 
-async def r2j(cmd: str) -> Any:
-    out = await r2(cmd)
+
+def r2(cmd: str) -> str:
+    with _CMD_LOCK:
+        print(f"[MCP]: {cmd}")
+        return cutter.cmd(cmd)
+
+
+def r2j(cmd: str) -> Any:
+    out = r2(cmd)
     if not out:
         return None
     try:
         return json.loads(out)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"json parse failed for '{cmd}': {e}")
+    except Exception as exc:
+        raise ApiError(500, f"json parse failed for '{cmd}': {exc}")
 
-# Generic pagination
 
 def paginate(items: List[Dict[str, Any]], offset: int, limit: int) -> Dict[str, Any]:
     total = len(items)
-    o = max(int(offset), 0)
-    l = max(min(int(limit), 1000), 1)
-    return {"items": items[o:o + l], "total": total, "offset": o, "limit": l}
+    safe_offset = max(int(offset), 0)
+    safe_limit = max(min(int(limit), 1000), 1)
+    return {
+        "items": items[safe_offset:safe_offset + safe_limit],
+        "total": total,
+        "offset": safe_offset,
+        "limit": safe_limit,
+    }
 
-# ---------- Health Check ----------
-@app.get("/api/v1/health")
-async def health() -> Dict[str, Any]:
+
+def _normalize_path(path: str) -> str:
+    return path.rstrip("/") or "/"
+
+
+def _first_query(params: Dict[str, List[str]], key: str, default: Optional[str] = None) -> Optional[str]:
+    values = params.get(key)
+    if not values:
+        return default
+    return values[0]
+
+
+def _query_str(
+    params: Dict[str, List[str]],
+    key: str,
+    default: Optional[str] = None,
+    required: bool = False,
+) -> Optional[str]:
+    value = _first_query(params, key, default)
+    if required and not value:
+        raise ApiError(400, f"{key} is required")
+    return value
+
+
+def _query_int(
+    params: Dict[str, List[str]],
+    key: str,
+    default: int,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    raw = _first_query(params, key)
+    if raw is None or raw == "":
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ApiError(400, f"{key} must be an integer")
+    if minimum is not None and value < minimum:
+        raise ApiError(400, f"{key} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise ApiError(400, f"{key} must be <= {maximum}")
+    return value
+
+
+def _body_str(body: Dict[str, Any], key: str, required: bool = True) -> str:
+    value = body.get(key)
+    if value is None:
+        if required:
+            raise ApiError(400, f"{key} is required")
+        return ""
+    if not isinstance(value, str):
+        raise ApiError(400, f"{key} must be a string")
+    if required and not value:
+        raise ApiError(400, f"{key} is required")
+    return value
+
+
+def _json_response(data: Any, status_code: int = 200) -> Tuple[int, str, bytes]:
+    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status_code, "application/json; charset=utf-8", payload
+
+
+def _text_response(text: str, status_code: int = 200) -> Tuple[int, str, bytes]:
+    return status_code, "text/plain; charset=utf-8", text.encode("utf-8")
+
+
+def _html_response(html: str, status_code: int = 200) -> Tuple[int, str, bytes]:
+    return status_code, "text/html; charset=utf-8", html.encode("utf-8")
+
+
+def health_endpoint(_: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
     try:
-        ver = (await r2("s")).strip()
+        current_addr = r2("s").strip()
     except Exception:
-        ver = "unknown"
-    return {"status": "ok", "r2": {"version": ver}}
+        current_addr = ""
+    return _json_response({"status": "ok", "current_address": current_addr})
 
-# ---------- Data Models (POST JSON Body) ----------
-class RenameFunctionReq(BaseModel):
-    addr: str
-    new_name: str
 
-class CommentReq(BaseModel):
-    addr: str
-    text: str
-
-class RenameVarReq(BaseModel):
-    func_addr: str
-    old_name: str
-    new_name: str
-
-class SetVarTypeReq(BaseModel):
-    func_addr: str
-    var_name: str
-    new_type: str
-
-class SetProtoReq(BaseModel):
-    addr: str
-    prototype: str
-
-# ---------- Functions ----------
-@app.get("/api/v1/functions")
-async def list_functions(offset: int = 0, limit: int = 100) -> Dict[str, Any]:
-    funcs = await r2j("aflj") or []
+def list_functions_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    offset = _query_int(params, "offset", 0, minimum=0)
+    limit = _query_int(params, "limit", 100, minimum=1, maximum=1000)
+    funcs = r2j("aflj") or []
     mapped = [
         {
-            "addr": hex(f.get("offset", 0)),
-            "name": f.get("name"),
-            "size": f.get("size", 0),
-            "n_bb": f.get("nbbs", 0),
+            "addr": hex(func.get("offset", 0)),
+            "name": func.get("name"),
+            "size": func.get("size", 0),
+            "n_bb": func.get("nbbs", 0),
         }
-        for f in funcs
+        for func in funcs
     ]
-    return paginate(mapped, offset, limit)
+    return _json_response(paginate(mapped, offset, limit))
 
-@app.get("/api/v1/functions/detail")
-async def function_detail(addr: str) -> Dict[str, Any]:
-    info = await r2j(f"afij @ {addr}") or []
+
+def function_detail_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    addr = _query_str(params, "addr", required=True)
+    info = r2j(f"afij @ {addr}") or []
     info0 = info[0] if isinstance(info, list) and info else {}
-    xrefs_in = await r2j(f"axtj @ {addr}") or []
-    return {"info": info0, "xrefs_in": xrefs_in}
+    xrefs_in = r2j(f"axtj @ {addr}") or []
+    return _json_response({"info": info0, "xrefs_in": xrefs_in})
 
-@app.post("/api/v1/functions/rename")
-async def rename_function(req: RenameFunctionReq) -> Dict[str, Any]:
-    if not req.addr or not req.new_name:
-        raise HTTPException(status_code=400, detail="addr and new_name are required")
-    await r2(f"afn {req.new_name} @ {req.addr}")
-    return {"ok": True}
 
-# ---------- Decompilation / Disassembly ----------
-@app.get("/api/v1/decompile")
-async def decompile(addr: str) -> Dict[str, Any]:
-    pseudo = await r2(f"pdg @ {addr}")  # requires r2ghidra/rz-ghidra plugin.. hummm
-    return {"addr": addr, "pseudo": pseudo}
+def rename_function_endpoint(body: Dict[str, Any]) -> Tuple[int, str, bytes]:
+    addr = _body_str(body, "addr")
+    new_name = _body_str(body, "new_name")
+    r2(f"afn {new_name} @ {addr}")
+    return _json_response({"ok": True})
 
-@app.get("/api/v1/disasm", response_class=PlainTextResponse)
-async def disasm(addr: str, fmt: str = Query("text", pattern="^(text|json)$")):
+
+def decompile_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    addr = _query_str(params, "addr", required=True)
+    pseudo = r2(f"pdg @ {addr}")
+    return _json_response({"addr": addr, "pseudo": pseudo})
+
+
+def disasm_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    addr = _query_str(params, "addr", required=True)
+    fmt = _query_str(params, "fmt", "text") or "text"
+    if fmt not in {"text", "json"}:
+        raise ApiError(400, "fmt must be text or json")
     if fmt == "json":
-        j = await r2j(f"pdfj @ {addr}") or {}
-        return json.dumps(j, ensure_ascii=False, indent=2)
-    return await r2(f"pdf @ {addr}")
+        payload = r2j(f"pdfj @ {addr}") or {}
+        return _text_response(json.dumps(payload, ensure_ascii=False, indent=2))
+    return _text_response(r2(f"pdf @ {addr}"))
 
-@app.get("/api/v1/pd")
-async def pd(addr: str, count: int = Query(32, ge=1, le=4096), fmt: str = Query("text", pattern="^(text|json)$")):
-    """Linear disassembly. Returns text by default; JSON for structured ops list.
-    - Text: equivalent to `pd {count} @ {addr}`.
-    - JSON: equivalent to `pdj {count} @ {addr}`, returns {"addr", "count", "ops":[...]}"""
+
+def pd_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    addr = _query_str(params, "addr", required=True)
+    count = _query_int(params, "count", 32, minimum=1, maximum=4096)
+    fmt = _query_str(params, "fmt", "text") or "text"
+    if fmt not in {"text", "json"}:
+        raise ApiError(400, "fmt must be text or json")
     if fmt == "json":
-        ops = await r2j(f"pdj {count} @ {addr}") or []
-        return {"addr": addr, "count": count, "ops": ops}
-    text = await r2(f"pdq {count} @ {addr}")
-    return PlainTextResponse(text)
+        ops = r2j(f"pdj {count} @ {addr}") or []
+        return _json_response({"addr": addr, "count": count, "ops": ops})
+    return _text_response(r2(f"pdq {count} @ {addr}"))
 
-# ---------- Strings / Segments / Bytes ----------
-@app.get("/api/v1/strings")
-async def list_strings(
-    offset: int = 0,
-    limit: int = 100,
-    contains: Optional[str] = None,
-    min_length: int = 0,
-) -> Dict[str, Any]:
-    j = await r2j("izj") or []
+
+def list_strings_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    offset = _query_int(params, "offset", 0, minimum=0)
+    limit = _query_int(params, "limit", 100, minimum=1, maximum=1000)
+    contains = _query_str(params, "contains", required=False)
+    min_length = _query_int(params, "min_length", 0, minimum=0)
+    strings = r2j("izj") or []
     items: List[Dict[str, Any]] = []
-    for s in j:
-        text = s.get("string", "")
+    for entry in strings:
+        text = entry.get("string", "")
         if contains and contains not in text:
             continue
         if min_length and len(text) < min_length:
             continue
         items.append(
             {
-                "addr": hex(s.get("vaddr", 0) or s.get("paddr", 0) or 0),
-                "length": s.get("length", 0),
-                "type": s.get("type"),
+                "addr": hex(entry.get("vaddr", 0) or entry.get("paddr", 0) or 0),
+                "length": entry.get("length", 0),
+                "type": entry.get("type"),
                 "string": text,
             }
         )
-    return paginate(items, offset, limit)
+    return _json_response(paginate(items, offset, limit))
 
-@app.get("/api/v1/segments")
-async def list_segments(offset: int = 0, limit: int = 100) -> Dict[str, Any]:
-    segs = await r2j("iSj") or []
+
+def list_segments_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    offset = _query_int(params, "offset", 0, minimum=0)
+    limit = _query_int(params, "limit", 100, minimum=1, maximum=1000)
+    segs = r2j("iSj") or []
     mapped = [
         {
-            "name": s.get("name"),
-            "vaddr": hex(s.get("vaddr", 0)),
-            "paddr": hex(s.get("paddr", 0)),
-            "size": s.get("vsize", 0) or s.get("size", 0),
-            "perm": s.get("perm"),
+            "name": seg.get("name"),
+            "vaddr": hex(seg.get("vaddr", 0)),
+            "paddr": hex(seg.get("paddr", 0)),
+            "size": seg.get("vsize", 0) or seg.get("size", 0),
+            "perm": seg.get("perm"),
         }
-        for s in segs
+        for seg in segs
     ]
-    return paginate(mapped, offset, limit)
+    return _json_response(paginate(mapped, offset, limit))
 
-@app.get("/api/v1/bytes")
-async def read_bytes(addr: str, size: int = Query(64, ge=1, le=65536)) -> Dict[str, Any]:
-    j = await r2j(f"pxj {size} @ {addr}") or []
-    return {"addr": addr, "size": size, "bytes": j}
 
-# ---------- Variables / Comments ----------
-@app.get("/api/v1/vars")
-async def list_vars(addr: str) -> Dict[str, Any]:
-    varsj: Any = None
+def read_bytes_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    addr = _query_str(params, "addr", required=True)
+    size = _query_int(params, "size", 64, minimum=1, maximum=65536)
+    data = r2j(f"pxj {size} @ {addr}") or []
+    return _json_response({"addr": addr, "size": size, "bytes": data})
+
+
+def list_vars_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    addr = _query_str(params, "addr", required=True)
     try:
-        varsj = await r2j(f"afvlj @ {addr}")
-    except HTTPException:
+        varsj = r2j(f"afvlj @ {addr}")
+    except ApiError:
         varsj = None
 
     out = {"reg": [], "stack": [], "args": [], "bpvars": []}
-
     if isinstance(varsj, dict):
-        for k in ("reg", "regs", "args", "bpvars", "stack", "vars", "locals"):
-            if k in varsj and isinstance(varsj[k], list):
-                if k in ("reg", "regs"):
-                    out["reg"] = varsj[k]
-                elif k in ("vars", "locals", "stack"):
-                    out["stack"] = varsj[k]
-                else:
-                    out[k] = varsj[k]
+        for key in ("reg", "regs", "args", "bpvars", "stack", "vars", "locals"):
+            value = varsj.get(key)
+            if not isinstance(value, list):
+                continue
+            if key in {"reg", "regs"}:
+                out["reg"] = value
+            elif key in {"vars", "locals", "stack"}:
+                out["stack"] = value
+            else:
+                out[key] = value
+    return _json_response({"addr": addr, "vars": out})
 
-    return {"addr": addr, "vars": out}
 
-@app.post("/api/v1/comments")
-async def set_comment(req: CommentReq) -> Dict[str, Any]:
-    if not req.addr:
-        raise HTTPException(status_code=400, detail="addr required")
-    await r2(f"CCu {json.dumps(req.text)} @ {req.addr}")
-    return {"ok": True}
+def set_comment_endpoint(body: Dict[str, Any]) -> Tuple[int, str, bytes]:
+    addr = _body_str(body, "addr")
+    text = _body_str(body, "text")
+    r2(f"CCu {json.dumps(text)} @ {addr}")
+    return _json_response({"ok": True})
 
-# ---------- Current Position / Shortcuts ----------
-@app.get("/api/v1/current/address")
-async def current_address() -> Dict[str, Any]:
-    val = (await r2("s")).strip()
+
+def current_address_endpoint(_: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    value = r2("s").strip()
     try:
-        addr = hex(int(val, 16))
+        addr = hex(int(value, 16))
     except Exception:
-        s_now = (await r2("s")).strip()
-        addr = s_now if s_now.startswith("0x") else val
-    return {"addr": addr}
+        addr = value if value.startswith("0x") else value
+    return _json_response({"addr": addr})
 
-@app.get("/api/v1/current/function")
-async def current_function() -> Dict[str, Any]:
-    info = await r2j("afij @ $$") or []
-    return {"info": (info[0] if isinstance(info, list) and info else {})}
 
-# ---------- XREF / Symbols / Entry Points ----------
-@app.get("/api/v1/xrefs")
-async def xrefs_to(addr: str) -> Dict[str, Any]:
-    refs = await r2j(f"axtj @ {addr}") or []
-    return {"addr": addr, "xrefs": refs}
+def current_function_endpoint(_: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    info = r2j("afij @ $$") or []
+    info0 = info[0] if isinstance(info, list) and info else {}
+    return _json_response({"info": info0})
 
-@app.get("/api/v1/globals")
-async def list_globals(
-    offset: int = 0,
-    limit: int = 100,
-    name_contains: Optional[str] = None,
-    typ: Optional[str] = Query(None, description="Filter symbol type, e.g., FUNC/OBJECT/NOTYPE etc."),
-) -> Dict[str, Any]:
-    syms = await r2j("isj") or []
+
+def xrefs_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    addr = _query_str(params, "addr", required=True)
+    refs = r2j(f"axtj @ {addr}") or []
+    return _json_response({"addr": addr, "xrefs": refs})
+
+
+def list_globals_endpoint(params: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
+    offset = _query_int(params, "offset", 0, minimum=0)
+    limit = _query_int(params, "limit", 100, minimum=1, maximum=1000)
+    name_contains = _query_str(params, "name_contains", required=False)
+    typ = _query_str(params, "typ", required=False)
+    syms = r2j("isj") or []
     items: List[Dict[str, Any]] = []
-    for s in syms:
-        it = {
-            "name": s.get("name"),
-            "addr": hex(s.get("vaddr", 0)),
-            "paddr": hex(s.get("paddr", 0)),
-            "size": s.get("size", 0),
-            "bind": s.get("bind"),
-            "type": s.get("type"),
+    for sym in syms:
+        item = {
+            "name": sym.get("name"),
+            "addr": hex(sym.get("vaddr", 0)),
+            "paddr": hex(sym.get("paddr", 0)),
+            "size": sym.get("size", 0),
+            "bind": sym.get("bind"),
+            "type": sym.get("type"),
         }
-        if name_contains and name_contains not in (it["name"] or ""):
+        if name_contains and name_contains not in (item["name"] or ""):
             continue
-        if typ and (it["type"] or "").upper() != typ.upper():
+        if typ and (item["type"] or "").upper() != typ.upper():
             continue
-        items.append(it)
-    return paginate(items, offset, limit)
+        items.append(item)
+    return _json_response(paginate(items, offset, limit))
 
-@app.get("/api/v1/entrypoints")
-async def list_entrypoints() -> Dict[str, Any]:
-    try:
-        eps = await r2j("iej")
-    except HTTPException:
-        eps = None
-    return {"entries": eps or []}
 
-# ---------- Variable Enhancements: Rename / Set Type ----------
-async def _with_seek(addr: str, coro):
-    cur = (await r2("s")).strip()
+def entrypoints_endpoint(_: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
     try:
-        await r2(f"s {addr}")
-        return await coro()
+        entries = r2j("iej")
+    except ApiError:
+        entries = None
+    return _json_response({"entries": entries or []})
+
+
+def _with_seek(addr: str, callback) -> Any:
+    current = r2("s").strip()
+    try:
+        r2(f"s {addr}")
+        return callback()
     finally:
-        if cur:
-            await r2(f"s {cur}")
+        if current:
+            r2(f"s {current}")
 
-@app.post("/api/v1/vars/rename")
-async def rename_local_variable(req: RenameVarReq) -> Dict[str, Any]:
-    if not (req.func_addr and req.old_name and req.new_name):
-        raise HTTPException(status_code=400, detail="func_addr, old_name, new_name are required")
 
-    async def _do():
-        try:
-            await r2(f"afvn {req.new_name} {req.old_name}")
-        except Exception:
-            await r2(f"afvn {req.old_name} {req.new_name}")
-    await _with_seek(req.func_addr, _do)
-    return {"ok": True}
+def rename_local_variable_endpoint(body: Dict[str, Any]) -> Tuple[int, str, bytes]:
+    func_addr = _body_str(body, "func_addr")
+    old_name = _body_str(body, "old_name")
+    new_name = _body_str(body, "new_name")
 
-@app.post("/api/v1/vars/set_type")
-async def set_local_variable_type(req: SetVarTypeReq) -> Dict[str, Any]:
-    if not (req.func_addr and req.var_name and req.new_type):
-        raise HTTPException(status_code=400, detail="func_addr, var_name, new_type are required")
+    def _rename() -> None:
+        r2(f"afvn {new_name} {old_name}")
 
-    async def _do():
-        await r2(f"afvt {req.var_name} {req.new_type}")
-    await _with_seek(req.func_addr, _do)
-    return {"ok": True}
+    _with_seek(func_addr, _rename)
+    return _json_response({"ok": True})
 
-# ---------- Type System / Function Prototypes ----------
-@app.get("/api/v1/types")
-async def list_types() -> Dict[str, Any]:
+
+def set_local_variable_type_endpoint(body: Dict[str, Any]) -> Tuple[int, str, bytes]:
+    func_addr = _body_str(body, "func_addr")
+    var_name = _body_str(body, "var_name")
+    new_type = _body_str(body, "new_type")
+
+    def _set_type() -> None:
+        r2(f"afvt {var_name} {new_type}")
+
+    _with_seek(func_addr, _set_type)
+    return _json_response({"ok": True})
+
+
+def list_types_endpoint(_: Dict[str, List[str]]) -> Tuple[int, str, bytes]:
     try:
-        t = await r2j("tj")
-    except HTTPException:
-        t = None
-    return {"types": t or []}
+        types = r2j("tj")
+    except ApiError:
+        types = None
+    return _json_response({"types": types or []})
 
-@app.post("/api/v1/functions/set_prototype")
-async def set_function_prototype(req: SetProtoReq) -> Dict[str, Any]:
-    if not (req.addr and req.prototype):
-        raise HTTPException(status_code=400, detail="addr and prototype are required")
-    await r2(f"afs {req.addr} {json.dumps(req.prototype)}")
-    return {"ok": True}
 
-# =============================
-#       Cutter Plugin Part
-# =============================
+def set_function_prototype_endpoint(body: Dict[str, Any]) -> Tuple[int, str, bytes]:
+    addr = _body_str(body, "addr")
+    prototype = _body_str(body, "prototype")
+    r2(f"afs {addr} {json.dumps(prototype)}")
+    return _json_response({"ok": True})
 
-class UvicornThread(threading.Thread):
-    """Run uvicorn.Server in a separate thread for graceful shutdown."""
 
-    def __init__(self, host: str, port: int, log_level: str = "warning"):
+def docs_endpoint() -> Tuple[int, str, bytes]:
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cutter MCP Plugin API</title>
+  <style>
+    body {{ font-family: sans-serif; margin: 2rem auto; max-width: 900px; line-height: 1.5; }}
+    code {{ background: #f3f3f3; padding: 0.1rem 0.3rem; border-radius: 4px; }}
+    li {{ margin: 0.3rem 0; }}
+  </style>
+</head>
+<body>
+  <h1>Cutter MCP Plugin API</h1>
+  <p>Version {PLUGIN_VERSION}. This server intentionally uses only Python stdlib so it can run inside Cutter's embedded Python on Windows.</p>
+  <h2>GET</h2>
+  <ul>
+    <li><code>/api/v1/health</code></li>
+    <li><code>/api/v1/functions</code></li>
+    <li><code>/api/v1/functions/detail?addr=0x...</code></li>
+    <li><code>/api/v1/decompile?addr=0x...</code></li>
+    <li><code>/api/v1/disasm?addr=0x...&amp;fmt=text|json</code></li>
+    <li><code>/api/v1/pd?addr=0x...&amp;count=32&amp;fmt=text|json</code></li>
+    <li><code>/api/v1/strings</code></li>
+    <li><code>/api/v1/segments</code></li>
+    <li><code>/api/v1/bytes?addr=0x...&amp;size=64</code></li>
+    <li><code>/api/v1/vars?addr=0x...</code></li>
+    <li><code>/api/v1/current/address</code></li>
+    <li><code>/api/v1/current/function</code></li>
+    <li><code>/api/v1/xrefs?addr=0x...</code></li>
+    <li><code>/api/v1/globals</code></li>
+    <li><code>/api/v1/entrypoints</code></li>
+    <li><code>/api/v1/types</code></li>
+  </ul>
+  <h2>POST</h2>
+  <ul>
+    <li><code>/api/v1/functions/rename</code></li>
+    <li><code>/api/v1/comments</code></li>
+    <li><code>/api/v1/vars/rename</code></li>
+    <li><code>/api/v1/vars/set_type</code></li>
+    <li><code>/api/v1/functions/set_prototype</code></li>
+  </ul>
+</body>
+</html>
+"""
+    return _html_response(html)
+
+
+GET_ROUTES = {
+    "/api/v1/health": health_endpoint,
+    "/api/v1/functions": list_functions_endpoint,
+    "/api/v1/functions/detail": function_detail_endpoint,
+    "/api/v1/decompile": decompile_endpoint,
+    "/api/v1/disasm": disasm_endpoint,
+    "/api/v1/pd": pd_endpoint,
+    "/api/v1/strings": list_strings_endpoint,
+    "/api/v1/segments": list_segments_endpoint,
+    "/api/v1/bytes": read_bytes_endpoint,
+    "/api/v1/vars": list_vars_endpoint,
+    "/api/v1/current/address": current_address_endpoint,
+    "/api/v1/current/function": current_function_endpoint,
+    "/api/v1/xrefs": xrefs_endpoint,
+    "/api/v1/globals": list_globals_endpoint,
+    "/api/v1/entrypoints": entrypoints_endpoint,
+    "/api/v1/types": list_types_endpoint,
+}
+
+POST_ROUTES = {
+    "/api/v1/functions/rename": rename_function_endpoint,
+    "/api/v1/comments": set_comment_endpoint,
+    "/api/v1/vars/rename": rename_local_variable_endpoint,
+    "/api/v1/vars/set_type": set_local_variable_type_endpoint,
+    "/api/v1/functions/set_prototype": set_function_prototype_endpoint,
+}
+
+
+class CutterAPIRequestHandler(BaseHTTPRequestHandler):
+    server_version = f"CutterMCP/{PLUGIN_VERSION}"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:
+        self._handle("GET")
+
+    def do_POST(self) -> None:
+        self._handle("POST")
+
+    def _handle(self, method: str) -> None:
+        try:
+            parsed = urlparse(self.path)
+            path = _normalize_path(parsed.path)
+            params = parse_qs(parsed.query, keep_blank_values=True)
+
+            if method == "GET" and path == "/docs":
+                status_code, content_type, payload = docs_endpoint()
+            elif method == "GET":
+                handler = GET_ROUTES.get(path)
+                if handler is None:
+                    raise ApiError(404, f"unknown path: {path}")
+                status_code, content_type, payload = handler(params)
+            else:
+                handler = POST_ROUTES.get(path)
+                if handler is None:
+                    raise ApiError(404, f"unknown path: {path}")
+                body = self._read_json_body()
+                status_code, content_type, payload = handler(body)
+        except ApiError as exc:
+            status_code, content_type, payload = _json_response({"detail": exc.detail}, exc.status_code)
+        except Exception as exc:
+            status_code, content_type, payload = _json_response({"detail": str(exc)}, 500)
+
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _read_json_body(self) -> Dict[str, Any]:
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except ValueError:
+            raise ApiError(400, "invalid Content-Length")
+        if length > _MAX_BODY_BYTES:
+            raise ApiError(413, "request body too large")
+        raw = self.rfile.read(length) if length else b""
+        if not raw:
+            return {}
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ApiError(400, f"invalid JSON body: {exc.msg}")
+        if not isinstance(body, dict):
+            raise ApiError(400, "JSON body must be an object")
+        return body
+
+
+class CutterHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class PluginHTTPThread(threading.Thread):
+    def __init__(self, host: str, port: int):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
-        self.log_level = log_level
-        self._server: uvicorn.Server | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._server = None
         self._started_evt = threading.Event()
+        self._start_error = ""
 
-    def run(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        config = uvicorn.Config(
-            app,
-            host=self.host,
-            port=self.port,
-            log_level=self.log_level,
-            access_log=False,
-            lifespan="on",
-        )
-        self._server = uvicorn.Server(config)
-
-        async def serve_and_flag():
-            async def wait_port_open():
-                for _ in range(100):
-                    if self._server.started:
-                        self._started_evt.set()
-                        return
-                    await asyncio.sleep(0.05)
-                self._started_evt.set()
-            waiter = self._loop.create_task(wait_port_open())
-            await self._server.serve()
-            await waiter
-
+    def run(self) -> None:
         try:
-            self._loop.run_until_complete(serve_and_flag())
-        finally:
-            try:
-                self._loop.stop()
-            except Exception:
-                pass
-            self._loop.close()
+            self._server = CutterHTTPServer((self.host, self.port), CutterAPIRequestHandler)
+        except OSError as exc:
+            self._start_error = str(exc)
+            self._started_evt.set()
+            return
 
-    def stop(self):
-        if self._server:
-            self._server.should_exit = True
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(lambda: None)
+        self._started_evt.set()
+        try:
+            self._server.serve_forever(poll_interval=0.2)
+        finally:
+            self._server.server_close()
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
 
     def wait_started(self, timeout: float = 5.0) -> bool:
-        return self._started_evt.wait(timeout)
+        self._started_evt.wait(timeout)
+        return not self._start_error and self._server is not None
+
+    @property
+    def start_error(self) -> str:
+        return self._start_error
 
 
 class MCPDockWidget(cutter.CutterDockWidget):
@@ -390,7 +566,7 @@ class MCPDockWidget(cutter.CutterDockWidget):
         self.setObjectName("CutterMCPDock")
         self.setWindowTitle("MCP")
 
-        self._thread: UvicornThread | None = None
+        self._thread = None
         self._status = QLabel("Stopped")
         self._host_input = QLineEdit("127.0.0.1")
         self._port_input = QSpinBox()
@@ -409,59 +585,69 @@ class MCPDockWidget(cutter.CutterDockWidget):
 
         root = QWidget(self)
         self.setWidget(root)
-        v = QVBoxLayout(root)
-        v.addWidget(QLabel("Host:"))
-        v.addWidget(self._host_input)
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("Port:"))
-        hl.addWidget(self._port_input)
-        v.addLayout(hl)
-        v.addWidget(self._open_docs_chk)
-        v.addWidget(start_btn)
-        v.addWidget(stop_btn)
-        v.addWidget(health_btn)
-        v.addWidget(QLabel("Status:"))
-        v.addWidget(self._status)
-        v.addStretch(1)
+
+        layout = QVBoxLayout(root)
+        layout.addWidget(QLabel("Host:"))
+        layout.addWidget(self._host_input)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Port:"))
+        row.addWidget(self._port_input)
+        layout.addLayout(row)
+
+        layout.addWidget(self._open_docs_chk)
+        layout.addWidget(start_btn)
+        layout.addWidget(stop_btn)
+        layout.addWidget(health_btn)
+        layout.addWidget(QLabel("Status:"))
+        layout.addWidget(self._status)
+        layout.addStretch(1)
 
         QObject.connect(cutter.core(), SIGNAL("seekChanged(RVA)"), self.on_seek_changed)
 
-    def on_seek_changed(self):
+    def on_seek_changed(self) -> None:
         try:
-            cur = cutter.cmd("s").strip()
-            self._status.setText(f"{self.server_state()}  |  Current Address: {cur}")
+            current = cutter.cmd("s").strip()
+            self._status.setText(f"{self.server_state()}  |  Current Address: {current}")
         except Exception:
             pass
 
     def server_state(self) -> str:
         return "🟢 Running" if self._thread and self._thread.is_alive() else "🔴 Stopped"
 
-    def start_server(self):
+    def start_server(self) -> None:
         if self._thread and self._thread.is_alive():
             self._status.setText("🟢 Already running")
             return
+
         host = self._host_input.text().strip() or "127.0.0.1"
         port = int(self._port_input.value())
-        self._thread = UvicornThread(host, port)
+        self._thread = PluginHTTPThread(host, port)
         self._thread.start()
-        ok = self._thread.wait_started(5.0)
-        self._status.setText("🟢 Running" if ok else "Starting (timeout)")
-        if ok and self._open_docs_chk.isChecked() and host == "127.0.0.1":
-            webbrowser.open(f"http://127.0.0.1:{port}/docs")
 
-    def stop_server(self):
+        ok = self._thread.wait_started(5.0)
+        if ok:
+            self._status.setText(f"🟢 Running | http://{host}:{port}/docs")
+            if self._open_docs_chk.isChecked() and host == "127.0.0.1":
+                webbrowser.open(f"http://127.0.0.1:{port}/docs")
+            return
+
+        detail = self._thread.start_error or "startup timeout"
+        self._status.setText(f"🔴 Failed: {detail}")
+        self._thread = None
+
+    def stop_server(self) -> None:
         if not self._thread:
             self._status.setText("🔴 Stopped")
             return
-        self._thread.stop()
-        for _ in range(50):
-            if not self._thread.is_alive():
-                break
-            time.sleep(0.05)
+
+        thread = self._thread
+        thread.stop()
+        thread.join(timeout=2.0)
         self._thread = None
         self._status.setText("🔴 Stopped")
 
-    def check_health(self):
+    def check_health(self) -> None:
         host = self._host_input.text().strip() or "127.0.0.1"
         port = int(self._port_input.value())
         try:
@@ -474,29 +660,29 @@ class MCPDockWidget(cutter.CutterDockWidget):
         else:
             self._status.setText(f"{self.server_state()} | Port not open")
 
-    def closeEvent(self, ev):
-        super().closeEvent(ev)
+    def closeEvent(self, event) -> None:
+        super().closeEvent(event)
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         self.stop_server()
 
 
 class CutterMCPPlugin(cutter.CutterPlugin):
     name = "CutterMCP+"
-    description = "Expose Cutter/rizin info via a local FastAPI server for MCP"
-    version = "0.1.0"
+    description = "Expose Cutter/rizin info via a local HTTP server for MCP"
+    version = PLUGIN_VERSION
     author = "restkhz"
 
-    def setupPlugin(self):
-        self._widget: MCPDockWidget | None = None
+    def setupPlugin(self) -> None:
+        self._widget = None
 
-    def setupInterface(self, main):
+    def setupInterface(self, main) -> None:
         action = QAction("Cutter MCP Server", main)
         action.setCheckable(True)
         self._widget = MCPDockWidget(main, action)
         main.addPluginDockWidget(self._widget, action)
 
-    def terminate(self):
+    def terminate(self) -> None:
         if self._widget:
             self._widget.shutdown()
             self._widget = None
@@ -504,19 +690,3 @@ class CutterMCPPlugin(cutter.CutterPlugin):
 
 def create_cutter_plugin():
     return CutterMCPPlugin()
-
-
-# --------------CLI Debugging --------------
-if __name__ == "__main__":
-    import argparse
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--run-server", action="store_true")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8000)
-    args = p.parse_args()
-
-    if args.run_server:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
-    else:
-        print("This is a Cutter plugin module. Use --run-server to debug FastAPI server.")
